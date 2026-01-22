@@ -1,7 +1,7 @@
 import json
 import base64
+import time
 from datetime import datetime, date
-from typing import Optional, Dict, Any
 
 import httpx
 import streamlit as st
@@ -17,18 +17,7 @@ def build_basic_auth(username: str, password: str) -> str:
     return f"Basic {token}"
 
 def build_fusion_url(base_url: str, endpoint: str) -> str:
-    # base_url example: https://xyz.fa.oraclecloud.com  (no trailing slash required)
     return f"{base_url.rstrip('/')}/fscmRestApi/resources/{FUSION_REST_VERSION}/{endpoint}"
-
-def get_oracle_creds_from_ui():
-    base_url = (st.session_state.get("oracle_base_url") or "").strip()
-    username = (st.session_state.get("oracle_username") or "").strip()
-    password = (st.session_state.get("oracle_password") or "")
-    if not base_url or not username or not password:
-        return None, None, None, json.dumps({
-            "error": "Missing Oracle inputs. Fill Base URL, Username, Password in the sidebar."
-        })
-    return base_url, username, password, None
 
 def handle_oracle_error(e: Exception) -> str:
     if isinstance(e, httpx.HTTPStatusError):
@@ -52,14 +41,92 @@ def handle_oracle_error(e: Exception) -> str:
         return json.dumps({"error": "Oracle connection failed. Check base URL / network."})
     return json.dumps({"error": f"Unexpected error: {type(e).__name__}: {str(e)}"})
 
-def oracle_get(endpoint: str, params: Optional[dict] = None) -> dict:
-    base_url, username, password, err = get_oracle_creds_from_ui()
-    if err:
-        raise RuntimeError(err)
+# =========================
+# Session state init
+# =========================
+def init_state():
+    defaults = {
+        "openai_key": "",
+        "oracle_base_url": "",
+        "oracle_username": "",
+        "oracle_password": "",
+        "oracle_auth_header": "",
+        "oracle_validated": False,
+        "oracle_status_msg": "Not connected",
+        "oracle_creds_dirty": True,
+        "last_validate_sig": "",
+        "chat": [],  # list of {role, content}
+        "tool_traces": [],  # list of {turn_index, tool_log}
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+init_state()
+
+# Mark creds dirty when user edits any Oracle field
+def mark_oracle_dirty():
+    st.session_state.oracle_creds_dirty = True
+    st.session_state.oracle_validated = False
+    st.session_state.oracle_auth_header = ""
+    st.session_state.oracle_status_msg = "Not connected"
+
+# =========================
+# Oracle validate + request using stored auth
+# =========================
+def oracle_validate_if_needed():
+    base_url = (st.session_state.oracle_base_url or "").strip()
+    username = (st.session_state.oracle_username or "").strip()
+    password = (st.session_state.oracle_password or "")
+
+    # If missing, don't try validating
+    if not base_url or not username or not password:
+        st.session_state.oracle_validated = False
+        st.session_state.oracle_auth_header = ""
+        st.session_state.oracle_status_msg = "Not connected (missing fields)"
+        return
+
+    # Avoid validating repeatedly on every rerun if nothing changed
+    sig = f"{base_url}|{username}|{len(password)}"
+    if (not st.session_state.oracle_creds_dirty) and st.session_state.oracle_validated and st.session_state.last_validate_sig == sig:
+        return
+
+    # Validate once per change
+    st.session_state.last_validate_sig = sig
+    st.session_state.oracle_status_msg = "Validating..."
+
+    auth_header = build_basic_auth(username, password)
+    url = build_fusion_url(base_url, "receivablesInvoices")
+
+    try:
+        with httpx.Client(timeout=30.0, verify=False) as client:
+            r = client.get(
+                url,
+                headers={"Authorization": auth_header, "Content-Type": "application/json"},
+                params={"limit": 1},
+            )
+            r.raise_for_status()
+
+        st.session_state.oracle_auth_header = auth_header
+        st.session_state.oracle_validated = True
+        st.session_state.oracle_creds_dirty = False
+        st.session_state.oracle_status_msg = "Connected ✅"
+
+    except Exception as e:
+        st.session_state.oracle_validated = False
+        st.session_state.oracle_auth_header = ""
+        st.session_state.oracle_creds_dirty = True
+        # keep message short; details will show in tool outputs
+        st.session_state.oracle_status_msg = "Connection failed ❌"
+
+def oracle_get(endpoint: str, params: dict | None = None) -> dict:
+    base_url = (st.session_state.oracle_base_url or "").strip()
+    auth_header = st.session_state.oracle_auth_header
+
+    if not st.session_state.oracle_validated or not base_url or not auth_header:
+        raise RuntimeError(json.dumps({"error": "Oracle not connected. Fill creds; wait for Connected ✅."}))
 
     url = build_fusion_url(base_url, endpoint)
-    auth_header = build_basic_auth(username, password)
-
     with httpx.Client(timeout=60.0, verify=False) as client:
         resp = client.get(
             url,
@@ -70,23 +137,8 @@ def oracle_get(endpoint: str, params: Optional[dict] = None) -> dict:
         return resp.json()
 
 # =========================
-# Tool implementations (called by agent)
+# Tools (model calls these)
 # =========================
-def tool_test_connection(_: dict) -> str:
-    try:
-        _ = oracle_get("receivablesInvoices", {"limit": 1})
-        base_url = (st.session_state.get("oracle_base_url") or "").strip()
-        return json.dumps({
-            "status": "connected",
-            "base_url": base_url,
-            "message": "Successfully connected to Oracle Fusion AR REST API."
-        }, indent=2)
-    except Exception as e:
-        # If oracle_get threw a RuntimeError with JSON string, surface it
-        if isinstance(e, RuntimeError):
-            return str(e)
-        return handle_oracle_error(e)
-
 def tool_list_invoices(args: dict) -> str:
     customer_account_id = args.get("customer_account_id")
     invoice_number = args.get("invoice_number")
@@ -95,7 +147,6 @@ def tool_list_invoices(args: dict) -> str:
     offset = int(args.get("offset", 0))
 
     params = {"limit": limit, "offset": offset}
-
     filters = []
     if customer_account_id:
         filters.append(f"CustomerAccountId={customer_account_id}")
@@ -109,25 +160,20 @@ def tool_list_invoices(args: dict) -> str:
     try:
         data = oracle_get("receivablesInvoices", params)
         items = data.get("items", [])
-
-        invoices = []
-        for inv in items:
-            invoices.append({
-                "invoice_id": inv.get("CustomerTransactionId"),
-                "invoice_number": inv.get("TransactionNumber"),
-                "customer_account_id": inv.get("CustomerAccountId"),
-                "customer_name": inv.get("BillToCustomerName"),
-                "invoice_date": inv.get("TransactionDate"),
-                "due_date": inv.get("DueDate"),
-                "amount": inv.get("EnteredAmount"),
-                "balance_due": inv.get("BalanceDue"),
-                "currency": inv.get("EnteredCurrencyCode"),
-                "status": inv.get("Status"),
-                "business_unit": inv.get("BusinessUnit"),
-            })
+        invoices = [{
+            "invoice_number": inv.get("TransactionNumber"),
+            "customer_account_id": inv.get("CustomerAccountId"),
+            "customer_name": inv.get("BillToCustomerName"),
+            "invoice_date": inv.get("TransactionDate"),
+            "due_date": inv.get("DueDate"),
+            "amount": inv.get("EnteredAmount"),
+            "balance_due": inv.get("BalanceDue"),
+            "currency": inv.get("EnteredCurrencyCode"),
+            "status": inv.get("Status"),
+            "business_unit": inv.get("BusinessUnit"),
+        } for inv in items]
 
         return json.dumps({
-            "endpoint_called": "receivablesInvoices",
             "count": len(invoices),
             "invoices": invoices,
             "has_more": data.get("hasMore", False),
@@ -157,24 +203,19 @@ def tool_list_receipts(args: dict) -> str:
     try:
         data = oracle_get("standardReceipts", params)
         items = data.get("items", [])
-
-        receipts = []
-        for r in items:
-            receipts.append({
-                "receipt_id": r.get("CashReceiptId"),
-                "receipt_number": r.get("ReceiptNumber"),
-                "customer_account_id": r.get("CustomerAccountId"),
-                "customer_name": r.get("CustomerName"),
-                "receipt_date": r.get("ReceiptDate"),
-                "amount": r.get("Amount"),
-                "currency": r.get("CurrencyCode"),
-                "status": r.get("Status"),
-                "payment_method": r.get("PaymentMethod"),
-                "business_unit": r.get("BusinessUnit"),
-            })
+        receipts = [{
+            "receipt_number": r.get("ReceiptNumber"),
+            "customer_account_id": r.get("CustomerAccountId"),
+            "customer_name": r.get("CustomerName"),
+            "receipt_date": r.get("ReceiptDate"),
+            "amount": r.get("Amount"),
+            "currency": r.get("CurrencyCode"),
+            "status": r.get("Status"),
+            "payment_method": r.get("PaymentMethod"),
+            "business_unit": r.get("BusinessUnit"),
+        } for r in items]
 
         return json.dumps({
-            "endpoint_called": "standardReceipts",
             "count": len(receipts),
             "receipts": receipts,
             "has_more": data.get("hasMore", False),
@@ -249,11 +290,9 @@ def tool_aging_summary(args: dict) -> str:
             bal = inv.get("BalanceDue") or 0
             if bal <= 0:
                 continue
-
             due_str = inv.get("DueDate")
             if not due_str:
                 continue
-
             try:
                 due_dt = datetime.fromisoformat(due_str.replace("Z", "+00:00")).date()
             except Exception:
@@ -275,7 +314,6 @@ def tool_aging_summary(args: dict) -> str:
             buckets[b]["amount"] += float(bal)
 
         return json.dumps({
-            "endpoint_called": "receivablesInvoices",
             "aging_buckets": {k: {"count": v["count"], "amount": round(v["amount"], 2)} for k, v in buckets.items()},
             "total_outstanding": round(sum(v["amount"] for v in buckets.values()), 2),
         }, indent=2)
@@ -284,19 +322,7 @@ def tool_aging_summary(args: dict) -> str:
             return str(e)
         return handle_oracle_error(e)
 
-
-# =========================
-# OpenAI tool schema + dispatch
-# =========================
 TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "oracle_ar_test_connection",
-            "description": "Test Oracle Fusion connection using sidebar base URL/username/password.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
     {
         "type": "function",
         "function": {
@@ -360,28 +386,14 @@ TOOLS = [
 ]
 
 TOOL_DISPATCH = {
-    "oracle_ar_test_connection": tool_test_connection,
     "oracle_ar_list_invoices": tool_list_invoices,
     "oracle_ar_list_receipts": tool_list_receipts,
     "oracle_ar_get_customer_summary": tool_customer_summary,
     "oracle_ar_get_aging_summary": tool_aging_summary,
 }
 
-def run_agent(user_text: str, openai_key: str):
+def run_agent(messages, openai_key: str):
     client = OpenAI(api_key=openai_key)
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an Oracle Fusion AR assistant. "
-                "When the user asks for invoices, receipts, customer summary, or aging, call the correct tool. "
-                "Do not ask the user for passwords. Credentials are in the sidebar. "
-                "If Oracle creds are missing, instruct the user to fill the sidebar fields."
-            ),
-        },
-        {"role": "user", "content": user_text},
-    ]
 
     tool_log = []
 
@@ -397,45 +409,32 @@ def run_agent(user_text: str, openai_key: str):
         if not msg.tool_calls:
             return (msg.content or "").strip(), tool_log
 
-        # record assistant tool calls
         messages.append(
-            {
-                "role": "assistant",
-                "content": msg.content,
-                "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
-            }
+            {"role": "assistant", "content": msg.content, "tool_calls": [tc.model_dump() for tc in msg.tool_calls]}
         )
 
         for tc in msg.tool_calls:
-            tool_name = tc.function.name
+            name = tc.function.name
             raw_args = tc.function.arguments or "{}"
             try:
                 args = json.loads(raw_args)
             except Exception:
                 args = {}
 
-            tool_log.append({"tool": tool_name, "arguments": args})
+            tool_log.append({"tool": name, "arguments": args})
+            fn = TOOL_DISPATCH.get(name)
+            result = fn(args) if fn else json.dumps({"error": f"Unknown tool: {name}"})
 
-            fn = TOOL_DISPATCH.get(tool_name)
-            result = fn(args) if fn else json.dumps({"error": f"Unknown tool: {tool_name}"})
-
-            messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": str(result)}
-            )
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
 
     return "Stopped: too many tool calls.", tool_log
 
 
 # =========================
-# Streamlit UI
+# UI
 # =========================
 st.set_page_config(page_title="Oracle Fusion AR Agent (BYOK)", page_icon="🧾", layout="wide")
 st.title("Oracle Fusion AR Agent (BYOK)")
-
-# session defaults
-for k in ["openai_key", "oracle_base_url", "oracle_username", "oracle_password"]:
-    if k not in st.session_state:
-        st.session_state[k] = ""
 
 with st.sidebar:
     st.header("Inputs")
@@ -450,42 +449,66 @@ with st.sidebar:
         "Base URL",
         value=st.session_state.oracle_base_url,
         placeholder="https://<pod>.oraclecloud.com",
+        on_change=mark_oracle_dirty,
     )
-    st.session_state.oracle_username = st.text_input("Username", value=st.session_state.oracle_username)
-    st.session_state.oracle_password = st.text_input("Password", type="password", value=st.session_state.oracle_password)
+    st.session_state.oracle_username = st.text_input(
+        "Username", value=st.session_state.oracle_username, on_change=mark_oracle_dirty
+    )
+    st.session_state.oracle_password = st.text_input(
+        "Password", type="password", value=st.session_state.oracle_password, on_change=mark_oracle_dirty
+    )
+
+    # Auto-validate (no button)
+    oracle_validate_if_needed()
+    st.info(st.session_state.oracle_status_msg)
 
     if st.button("Clear all"):
-        for k in ["openai_key", "oracle_base_url", "oracle_username", "oracle_password"]:
-            st.session_state[k] = ""
+        for k in ["openai_key", "oracle_base_url", "oracle_username", "oracle_password",
+                  "oracle_auth_header", "oracle_validated", "oracle_status_msg", "oracle_creds_dirty",
+                  "last_validate_sig"]:
+            st.session_state[k] = "" if "key" in k or "url" in k or "user" in k or "pass" in k or "header" in k else False
+        st.session_state.oracle_status_msg = "Not connected"
+        st.session_state.chat = []
+        st.session_state.tool_traces = []
         st.rerun()
 
-prompt = st.text_input(
-    "Ask something",
-    placeholder="Example: List open invoices for customer account 12345 (limit 10)",
-)
+# Render chat history
+for msg in st.session_state.chat:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
 
-col1, col2 = st.columns(2)
-with col1:
-    run_clicked = st.button("Run")
-with col2:
-    test_clicked = st.button("Test Oracle Connection")
+# Chat input (keeps prior questions)
+user_text = st.chat_input("Ask: invoices, receipts, customer summary, aging...")
 
-if test_clicked:
-    st.subheader("Test Result")
-    st.code(tool_test_connection({}), language="json")
-
-if run_clicked:
+if user_text:
     ok = (st.session_state.openai_key or "").strip()
     if not ok:
         st.error("Paste your OpenAI API key in the sidebar.")
-    elif not prompt.strip():
-        st.warning("Type a question first.")
     else:
-        answer, tool_log = run_agent(prompt.strip(), ok)
+        # Add user message
+        st.session_state.chat.append({"role": "user", "content": user_text})
+        with st.chat_message("user"):
+            st.write(user_text)
 
-        if tool_log:
-            st.subheader("Tool calls")
-            st.json(tool_log)
+        # Build agent messages from chat
+        agent_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an Oracle Fusion AR assistant. "
+                    "Use tools to query Oracle Fusion AR when needed. "
+                    "Do NOT ask for Oracle credentials; they are already provided in the sidebar. "
+                    "If Oracle is not connected, tell the user to fix Base URL/Username/Password and wait for Connected ✅."
+                ),
+            }
+        ] + st.session_state.chat
 
-        st.subheader("Answer")
-        st.write(answer)
+        answer, tool_log = run_agent(agent_messages, ok)
+
+        # Show assistant response
+        st.session_state.chat.append({"role": "assistant", "content": answer})
+        with st.chat_message("assistant"):
+            st.write(answer)
+            if tool_log:
+                with st.expander("Tool calls"):
+                    st.json(tool_log)
