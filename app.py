@@ -1,18 +1,25 @@
 import json
 import base64
 from datetime import datetime, date
+
 import httpx
 import streamlit as st
 from openai import OpenAI
 
 FUSION_REST_VERSION = "11.13.18.05"
 
+
+# =========================
+# Helpers
+# =========================
 def build_basic_auth(username: str, password: str) -> str:
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
     return f"Basic {token}"
 
+
 def build_fusion_url(base_url: str, endpoint: str) -> str:
     return f"{base_url.rstrip('/')}/fscmRestApi/resources/{FUSION_REST_VERSION}/{endpoint}"
+
 
 def handle_oracle_error(e: Exception) -> str:
     if isinstance(e, httpx.HTTPStatusError):
@@ -23,20 +30,25 @@ def handle_oracle_error(e: Exception) -> str:
             return json.dumps({"error": "Oracle permission denied (403). Check Fusion roles."})
         if code == 404:
             return json.dumps({"error": "Oracle endpoint not found (404). Check base URL/version/endpoint."})
+        if code == 429:
+            return json.dumps({"error": "Oracle rate limit (429). Retry later."})
         try:
             detail = e.response.json()
         except Exception:
             detail = e.response.text
         return json.dumps({"error": f"Oracle API error ({code})", "detail": detail})
+
     if isinstance(e, httpx.TimeoutException):
         return json.dumps({"error": "Oracle request timed out."})
     if isinstance(e, httpx.ConnectError):
         return json.dumps({"error": "Oracle connection failed. Check base URL / network."})
+
     return json.dumps({"error": f"Unexpected error: {type(e).__name__}: {str(e)}"})
 
-# ------------------------
-# Session state init
-# ------------------------
+
+# =========================
+# Session State
+# =========================
 def init_state():
     defaults = {
         "openai_key": "",
@@ -45,65 +57,77 @@ def init_state():
         "oracle_password": "",
         "oracle_auth_header": "",
         "oracle_validated": False,
-        "oracle_status_msg": "Not connected",
         "oracle_creds_dirty": True,
         "last_validate_sig": "",
+        "oracle_status": "",  # "", "Connected ✅", "Connection failed ❌"
         "chat": [],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
+
 init_state()
+
 
 def mark_oracle_dirty():
     st.session_state.oracle_creds_dirty = True
     st.session_state.oracle_validated = False
     st.session_state.oracle_auth_header = ""
-    st.session_state.oracle_status_msg = "Not connected"
+    st.session_state.oracle_status = ""  # remove nag text
+
 
 def oracle_validate_if_needed():
     base_url = (st.session_state.oracle_base_url or "").strip()
     username = (st.session_state.oracle_username or "").strip()
     password = (st.session_state.oracle_password or "")
 
+    # If any field missing -> show nothing (no "not connected" message)
     if not base_url or not username or not password:
         st.session_state.oracle_validated = False
         st.session_state.oracle_auth_header = ""
-        st.session_state.oracle_status_msg = "Not connected (missing fields)"
+        st.session_state.oracle_status = ""
         return
 
     sig = f"{base_url}|{username}|{len(password)}"
-    if (not st.session_state.oracle_creds_dirty) and st.session_state.oracle_validated and st.session_state.last_validate_sig == sig:
+    if (
+        (not st.session_state.oracle_creds_dirty)
+        and st.session_state.oracle_validated
+        and st.session_state.last_validate_sig == sig
+    ):
         return
 
     st.session_state.last_validate_sig = sig
-    st.session_state.oracle_status_msg = "Validating..."
 
     auth_header = build_basic_auth(username, password)
     url = build_fusion_url(base_url, "receivablesInvoices")
 
     try:
         with httpx.Client(timeout=30.0, verify=False) as client:
-            r = client.get(url, headers={"Authorization": auth_header, "Content-Type": "application/json"}, params={"limit": 1})
+            r = client.get(
+                url,
+                headers={"Authorization": auth_header, "Content-Type": "application/json"},
+                params={"limit": 1},
+            )
             r.raise_for_status()
 
         st.session_state.oracle_auth_header = auth_header
         st.session_state.oracle_validated = True
         st.session_state.oracle_creds_dirty = False
-        st.session_state.oracle_status_msg = "Connected ✅"
+        st.session_state.oracle_status = "Connected ✅"
     except Exception:
         st.session_state.oracle_validated = False
         st.session_state.oracle_auth_header = ""
         st.session_state.oracle_creds_dirty = True
-        st.session_state.oracle_status_msg = "Connection failed ❌"
+        st.session_state.oracle_status = "Connection failed ❌"
+
 
 def oracle_get(endpoint: str, params: dict | None = None) -> dict:
     base_url = (st.session_state.oracle_base_url or "").strip()
     auth_header = st.session_state.oracle_auth_header
 
     if not st.session_state.oracle_validated or not base_url or not auth_header:
-        raise RuntimeError(json.dumps({"error": "Oracle not connected. Fill creds; wait for Connected ✅."}))
+        raise RuntimeError(json.dumps({"error": "Oracle not connected. Fill creds and ensure status shows Connected ✅."}))
 
     url = build_fusion_url(base_url, endpoint)
     with httpx.Client(timeout=60.0, verify=False) as client:
@@ -115,27 +139,19 @@ def oracle_get(endpoint: str, params: dict | None = None) -> dict:
         resp.raise_for_status()
         return resp.json()
 
-# ------------------------
-# New: customer lookup tool
-# ------------------------
+
+# =========================
+# Tools
+# =========================
 def tool_find_customers(args: dict) -> str:
-    """
-    Try to find customer accounts by name.
-    Because pods differ, we try multiple possible endpoints.
-    """
+    """Find customer accounts by exact-ish name (best-effort across pods)."""
     name = (args.get("name") or "").strip()
     limit = int(args.get("limit", 10))
     if not name:
         return json.dumps({"error": "name is required"})
 
-    # Candidate endpoints (pods vary)
-    candidate_endpoints = [
-        "customerAccounts",
-        "customers",
-        "tradingCommunityCustomers",
-    ]
+    candidate_endpoints = ["customerAccounts", "customers", "tradingCommunityCustomers"]
 
-    # Query patterns (pods vary). We'll try a few.
     query_patterns = [
         f"CustomerName={name}",
         f"PartyName={name}",
@@ -150,28 +166,92 @@ def tool_find_customers(args: dict) -> str:
                 data = oracle_get(ep, {"q": q, "limit": limit})
                 items = data.get("items", [])
                 if items:
-                    # Normalize common fields
                     results = []
                     for it in items:
-                        results.append({
-                            "customer_account_id": it.get("CustomerAccountId") or it.get("AccountId") or it.get("CustAccountId"),
-                            "customer_name": it.get("CustomerName") or it.get("PartyName") or it.get("AccountName") or it.get("CustomerAccountName"),
-                            "raw_keys_present": [k for k in ["CustomerAccountId","AccountId","CustAccountId","CustomerName","PartyName","AccountName","CustomerAccountName"] if it.get(k) is not None]
-                        })
+                        results.append(
+                            {
+                                "customer_account_id": it.get("CustomerAccountId")
+                                or it.get("AccountId")
+                                or it.get("CustAccountId"),
+                                "customer_name": it.get("CustomerName")
+                                or it.get("PartyName")
+                                or it.get("AccountName")
+                                or it.get("CustomerAccountName"),
+                            }
+                        )
                     return json.dumps({"endpoint_used": ep, "query_used": q, "matches": results}, indent=2)
+            except Exception as e:
+                errors.append({"endpoint": ep, "q": q, "error": str(e)[:200]})
+
+    return json.dumps(
+        {
+            "error": "Could not find customer by name with available endpoints/queries on this pod.",
+            "hint": "Pod may use a different customer endpoint.",
+            "attempts": errors[:6],
+        },
+        indent=2,
+    )
+
+
+def tool_list_customers(args: dict) -> str:
+    """List customers by name prefix (ABC -> ABC%)."""
+    starts_with = (args.get("starts_with") or "").strip()
+    limit = int(args.get("limit", 10))
+    if not starts_with:
+        return json.dumps({"error": "starts_with is required"})
+
+    candidate_endpoints = ["customerAccounts", "customers", "tradingCommunityCustomers"]
+
+    # Different pods accept different query syntaxes. Try multiple.
+    query_patterns = [
+        f"CustomerName LIKE '{starts_with}%'",
+        f"PartyName LIKE '{starts_with}%'",
+        f"AccountName LIKE '{starts_with}%'",
+        f"CustomerAccountName LIKE '{starts_with}%'",
+        # fallback (some pods only accept "="; this will be weaker)
+        f"CustomerName={starts_with}",
+    ]
+
+    errors = []
+    for ep in candidate_endpoints:
+        for q in query_patterns:
+            try:
+                data = oracle_get(ep, {"q": q, "limit": limit})
+                items = data.get("items", [])
+                if not items:
+                    continue
+
+                results = []
+                for it in items:
+                    results.append(
+                        {
+                            "customer_account_id": it.get("CustomerAccountId")
+                            or it.get("AccountId")
+                            or it.get("CustAccountId"),
+                            "customer_name": it.get("CustomerName")
+                            or it.get("PartyName")
+                            or it.get("AccountName")
+                            or it.get("CustomerAccountName"),
+                        }
+                    )
+
+                # Remove null names/ids
+                results = [r for r in results if r["customer_name"] or r["customer_account_id"]]
+                return json.dumps({"endpoint_used": ep, "query_used": q, "customers": results}, indent=2)
 
             except Exception as e:
                 errors.append({"endpoint": ep, "q": q, "error": str(e)[:200]})
 
-    return json.dumps({
-        "error": "Could not find customer by name with available endpoints/queries on this pod.",
-        "hint": "Your pod may use a different customer endpoint. You may need to adjust candidate_endpoints.",
-        "attempts": errors[:6]
-    }, indent=2)
+    return json.dumps(
+        {
+            "error": "Customer prefix search failed on this pod.",
+            "hint": "Adjust customer endpoints or query syntax for your pod.",
+            "attempts": errors[:6],
+        },
+        indent=2,
+    )
 
-# ------------------------
-# Existing tools, updated: invoices accepts customer_name too
-# ------------------------
+
 def tool_list_invoices(args: dict) -> str:
     customer_account_id = (args.get("customer_account_id") or "").strip() or None
     customer_name = (args.get("customer_name") or "").strip() or None
@@ -180,11 +260,10 @@ def tool_list_invoices(args: dict) -> str:
     limit = int(args.get("limit", 25))
     offset = int(args.get("offset", 0))
 
-    # If user gave a name, resolve it to an ID first
+    # Resolve name -> id if needed
     if (not customer_account_id) and customer_name:
         lookup = json.loads(tool_find_customers({"name": customer_name, "limit": 5}))
         if "matches" in lookup and lookup["matches"]:
-            # pick first match (simple); you can improve this later
             customer_account_id = lookup["matches"][0].get("customer_account_id")
 
     params = {"limit": limit, "offset": offset}
@@ -201,31 +280,38 @@ def tool_list_invoices(args: dict) -> str:
     try:
         data = oracle_get("receivablesInvoices", params)
         items = data.get("items", [])
-        invoices = [{
-            "invoice_number": inv.get("TransactionNumber"),
-            "customer_account_id": inv.get("CustomerAccountId"),
-            "customer_name": inv.get("BillToCustomerName"),
-            "invoice_date": inv.get("TransactionDate"),
-            "due_date": inv.get("DueDate"),
-            "amount": inv.get("EnteredAmount"),
-            "balance_due": inv.get("BalanceDue"),
-            "currency": inv.get("EnteredCurrencyCode"),
-            "status": inv.get("Status"),
-            "business_unit": inv.get("BusinessUnit"),
-        } for inv in items]
+        invoices = [
+            {
+                "invoice_number": inv.get("TransactionNumber"),
+                "customer_account_id": inv.get("CustomerAccountId"),
+                "customer_name": inv.get("BillToCustomerName"),
+                "invoice_date": inv.get("TransactionDate"),
+                "due_date": inv.get("DueDate"),
+                "amount": inv.get("EnteredAmount"),
+                "balance_due": inv.get("BalanceDue"),
+                "currency": inv.get("EnteredCurrencyCode"),
+                "status": inv.get("Status"),
+                "business_unit": inv.get("BusinessUnit"),
+            }
+            for inv in items
+        ]
 
-        return json.dumps({
-            "resolved_customer_account_id": customer_account_id,
-            "count": len(invoices),
-            "invoices": invoices,
-            "has_more": data.get("hasMore", False),
-            "offset": offset,
-            "limit": limit,
-        }, indent=2)
+        return json.dumps(
+            {
+                "resolved_customer_account_id": customer_account_id,
+                "count": len(invoices),
+                "invoices": invoices,
+                "has_more": data.get("hasMore", False),
+                "offset": offset,
+                "limit": limit,
+            },
+            indent=2,
+        )
     except Exception as e:
         if isinstance(e, RuntimeError):
             return str(e)
         return handle_oracle_error(e)
+
 
 def tool_list_receipts(args: dict) -> str:
     customer_account_id = args.get("customer_account_id")
@@ -245,29 +331,36 @@ def tool_list_receipts(args: dict) -> str:
     try:
         data = oracle_get("standardReceipts", params)
         items = data.get("items", [])
-        receipts = [{
-            "receipt_number": r.get("ReceiptNumber"),
-            "customer_account_id": r.get("CustomerAccountId"),
-            "customer_name": r.get("CustomerName"),
-            "receipt_date": r.get("ReceiptDate"),
-            "amount": r.get("Amount"),
-            "currency": r.get("CurrencyCode"),
-            "status": r.get("Status"),
-            "payment_method": r.get("PaymentMethod"),
-            "business_unit": r.get("BusinessUnit"),
-        } for r in items]
+        receipts = [
+            {
+                "receipt_number": r.get("ReceiptNumber"),
+                "customer_account_id": r.get("CustomerAccountId"),
+                "customer_name": r.get("CustomerName"),
+                "receipt_date": r.get("ReceiptDate"),
+                "amount": r.get("Amount"),
+                "currency": r.get("CurrencyCode"),
+                "status": r.get("Status"),
+                "payment_method": r.get("PaymentMethod"),
+                "business_unit": r.get("BusinessUnit"),
+            }
+            for r in items
+        ]
 
-        return json.dumps({
-            "count": len(receipts),
-            "receipts": receipts,
-            "has_more": data.get("hasMore", False),
-            "offset": offset,
-            "limit": limit,
-        }, indent=2)
+        return json.dumps(
+            {
+                "count": len(receipts),
+                "receipts": receipts,
+                "has_more": data.get("hasMore", False),
+                "offset": offset,
+                "limit": limit,
+            },
+            indent=2,
+        )
     except Exception as e:
         if isinstance(e, RuntimeError):
             return str(e)
         return handle_oracle_error(e)
+
 
 def tool_customer_summary(args: dict) -> str:
     customer_account_id = (args.get("customer_account_id") or "").strip()
@@ -275,8 +368,12 @@ def tool_customer_summary(args: dict) -> str:
         return json.dumps({"error": "customer_account_id is required."})
 
     try:
-        inv_data = oracle_get("receivablesInvoices", {"q": f"CustomerAccountId={customer_account_id}", "limit": 500})
-        rcpt_data = oracle_get("standardReceipts", {"q": f"CustomerAccountId={customer_account_id}", "limit": 500})
+        inv_data = oracle_get(
+            "receivablesInvoices", {"q": f"CustomerAccountId={customer_account_id}", "limit": 500}
+        )
+        rcpt_data = oracle_get(
+            "standardReceipts", {"q": f"CustomerAccountId={customer_account_id}", "limit": 500}
+        )
 
         invoices = inv_data.get("items", [])
         receipts = rcpt_data.get("items", [])
@@ -291,20 +388,24 @@ def tool_customer_summary(args: dict) -> str:
         elif receipts:
             customer_name = receipts[0].get("CustomerName")
 
-        return json.dumps({
-            "customer": {"customer_account_id": customer_account_id, "customer_name": customer_name},
-            "summary": {
-                "total_invoiced": round(total_invoiced, 2),
-                "total_paid": round(total_paid, 2),
-                "outstanding_balance": round(total_balance_due, 2),
-                "invoice_count": len(invoices),
-                "receipt_count": len(receipts),
-            }
-        }, indent=2)
+        return json.dumps(
+            {
+                "customer": {"customer_account_id": customer_account_id, "customer_name": customer_name},
+                "summary": {
+                    "total_invoiced": round(total_invoiced, 2),
+                    "total_paid": round(total_paid, 2),
+                    "outstanding_balance": round(total_balance_due, 2),
+                    "invoice_count": len(invoices),
+                    "receipt_count": len(receipts),
+                },
+            },
+            indent=2,
+        )
     except Exception as e:
         if isinstance(e, RuntimeError):
             return str(e)
         return handle_oracle_error(e)
+
 
 def tool_aging_summary(args: dict) -> str:
     customer_account_id = args.get("customer_account_id")
@@ -355,21 +456,40 @@ def tool_aging_summary(args: dict) -> str:
             buckets[b]["count"] += 1
             buckets[b]["amount"] += float(bal)
 
-        return json.dumps({
-            "aging_buckets": {k: {"count": v["count"], "amount": round(v["amount"], 2)} for k, v in buckets.items()},
-            "total_outstanding": round(sum(v["amount"] for v in buckets.values()), 2),
-        }, indent=2)
+        return json.dumps(
+            {
+                "aging_buckets": {k: {"count": v["count"], "amount": round(v["amount"], 2)} for k, v in buckets.items()},
+                "total_outstanding": round(sum(v["amount"] for v in buckets.values()), 2),
+            },
+            indent=2,
+        )
     except Exception as e:
         if isinstance(e, RuntimeError):
             return str(e)
         return handle_oracle_error(e)
 
+
 TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "oracle_ar_list_customers",
+            "description": "List customers by name prefix (e.g., starts_with='ABC'). Use when user asks for customer names or lists.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "starts_with": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                },
+                "required": ["starts_with"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "oracle_ar_find_customers",
-            "description": "Find customer accounts by customer name, returning candidate customer_account_id values.",
+            "description": "Find customer accounts by full customer name, returning candidate customer_account_id values.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -384,7 +504,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "oracle_ar_list_invoices",
-            "description": "List invoices. Use customer_account_id when possible. If user only provides customer_name, resolve it first.",
+            "description": "List invoices. Use customer_account_id when possible. If only customer_name is known, resolve it first.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -444,12 +564,14 @@ TOOLS = [
 ]
 
 TOOL_DISPATCH = {
+    "oracle_ar_list_customers": tool_list_customers,
     "oracle_ar_find_customers": tool_find_customers,
     "oracle_ar_list_invoices": tool_list_invoices,
     "oracle_ar_list_receipts": tool_list_receipts,
     "oracle_ar_get_customer_summary": tool_customer_summary,
     "oracle_ar_get_aging_summary": tool_aging_summary,
 }
+
 
 def run_agent(messages, openai_key: str):
     client = OpenAI(api_key=openai_key)
@@ -467,7 +589,9 @@ def run_agent(messages, openai_key: str):
         if not msg.tool_calls:
             return (msg.content or "").strip(), tool_log
 
-        messages.append({"role": "assistant", "content": msg.content, "tool_calls": [tc.model_dump() for tc in msg.tool_calls]})
+        messages.append(
+            {"role": "assistant", "content": msg.content, "tool_calls": [tc.model_dump() for tc in msg.tool_calls]}
+        )
 
         for tc in msg.tool_calls:
             name = tc.function.name
@@ -484,10 +608,11 @@ def run_agent(messages, openai_key: str):
 
     return "Stopped: too many tool calls.", tool_log
 
+
 # =========================
 # UI
 # =========================
-st.set_page_config(page_title="Oracle Receivables Agent", page_icon="X", layout="wide")
+st.set_page_config(page_title="Oracle Receivables Agent", page_icon="🧾", layout="wide")
 st.title("Oracle Receivables Agent")
 
 with st.sidebar:
@@ -499,19 +624,35 @@ with st.sidebar:
     st.divider()
 
     st.subheader("Oracle Fusion")
-    st.session_state.oracle_base_url = st.text_input("Base URL", value=st.session_state.oracle_base_url, on_change=mark_oracle_dirty)
-    st.session_state.oracle_username = st.text_input("Username", value=st.session_state.oracle_username, on_change=mark_oracle_dirty)
-    st.session_state.oracle_password = st.text_input("Password", type="password", value=st.session_state.oracle_password, on_change=mark_oracle_dirty)
+    st.session_state.oracle_base_url = st.text_input(
+        "Base URL",
+        value=st.session_state.oracle_base_url,
+        on_change=mark_oracle_dirty,
+        placeholder="https://<pod>.oraclecloud.com",
+    )
+    st.session_state.oracle_username = st.text_input(
+        "Username", value=st.session_state.oracle_username, on_change=mark_oracle_dirty
+    )
+    st.session_state.oracle_password = st.text_input(
+        "Password", type="password", value=st.session_state.oracle_password, on_change=mark_oracle_dirty
+    )
 
+    # auto-validate silently
     oracle_validate_if_needed()
-    st.info(st.session_state.oracle_status_msg)
 
-# Show chat
+    # show only meaningful status; no "not connected" spam
+    if st.session_state.oracle_status == "Connected ✅":
+        st.success("Connected ✅")
+    elif st.session_state.oracle_status == "Connection failed ❌":
+        st.error("Connection failed ❌")
+
+
+# show chat history
 for msg in st.session_state.chat:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
-user_text = st.chat_input("Ask: invoices, receipts, customer lookup, summary, aging...")
+user_text = st.chat_input("Ask: customer names starting with ABC, invoices for a customer, receipts, aging...")
 
 if user_text:
     ok = (st.session_state.openai_key or "").strip()
@@ -526,10 +667,11 @@ if user_text:
             {
                 "role": "system",
                 "content": (
-                    "You are an Oracle Fusion AR assistant. "
-                    "Users may mention customer names. If so, call oracle_ar_find_customers to get the account id, "
-                    "then call oracle_ar_list_invoices. "
-                    "Do not ask for passwords; credentials are in the sidebar."
+                    "You are an Oracle Fusion Receivables assistant. "
+                    "You MUST use tools for customer discovery, customer lists, invoices, receipts, aging, and summaries. "
+                    "If the user asks for customer names or customers starting with a prefix, call oracle_ar_list_customers. "
+                    "If the user gives a full customer name and needs invoices, call oracle_ar_find_customers then oracle_ar_list_invoices. "
+                    "Do not claim you lack access if a relevant tool exists."
                 ),
             }
         ] + st.session_state.chat
