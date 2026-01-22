@@ -487,8 +487,8 @@ def run_agent(messages, openai_key: str):
 # =========================
 # UI
 # =========================
-st.set_page_config(page_title="Oracle Fusion AR Agent (BYOK)", page_icon="🧾", layout="wide")
-st.title("Oracle Fusion AR Agent (BYOK)")
+st.set_page_config(page_title="Oracle Receivables Agent", page_icon="X", layout="wide")
+st.title("Oracle Receivables Agent")
 
 with st.sidebar:
     st.header("Inputs")
