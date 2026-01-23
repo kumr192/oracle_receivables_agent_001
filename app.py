@@ -6,6 +6,10 @@ import httpx
 import streamlit as st
 from openai import OpenAI
 
+# NOTE:
+# - Customer search in Financials (fscmRestApi) should use customerAccountSitesLOV + ReceivablesCustomerAccountFinder.
+# - Your old endpoints (customerAccounts/customers/tradingCommunityCustomers) often don't exist in FSCM pods.
+
 FUSION_REST_VERSION = "11.13.18.05"
 
 
@@ -60,6 +64,7 @@ def init_state():
         "oracle_creds_dirty": True,
         "last_validate_sig": "",
         "oracle_status": "",  # "", "Connected ✅", "Connection failed ❌"
+        "tls_verify": True,   # IMPORTANT: default True
         "chat": [],
     }
     for k, v in defaults.items():
@@ -74,7 +79,7 @@ def mark_oracle_dirty():
     st.session_state.oracle_creds_dirty = True
     st.session_state.oracle_validated = False
     st.session_state.oracle_auth_header = ""
-    st.session_state.oracle_status = ""  # remove nag text
+    st.session_state.oracle_status = ""
 
 
 def oracle_validate_if_needed():
@@ -82,14 +87,13 @@ def oracle_validate_if_needed():
     username = (st.session_state.oracle_username or "").strip()
     password = (st.session_state.oracle_password or "")
 
-    # If any field missing -> show nothing (no "not connected" message)
     if not base_url or not username or not password:
         st.session_state.oracle_validated = False
         st.session_state.oracle_auth_header = ""
         st.session_state.oracle_status = ""
         return
 
-    sig = f"{base_url}|{username}|{len(password)}"
+    sig = f"{base_url}|{username}|{len(password)}|verify={st.session_state.tls_verify}"
     if (
         (not st.session_state.oracle_creds_dirty)
         and st.session_state.oracle_validated
@@ -100,13 +104,20 @@ def oracle_validate_if_needed():
     st.session_state.last_validate_sig = sig
 
     auth_header = build_basic_auth(username, password)
+
+    # Use a very safe endpoint for connectivity check.
+    # receivablesInvoices is usually available; limit=1 is light.
     url = build_fusion_url(base_url, "receivablesInvoices")
 
     try:
-        with httpx.Client(timeout=30.0, verify=False) as client:
+        with httpx.Client(timeout=30.0, verify=st.session_state.tls_verify) as client:
             r = client.get(
                 url,
-                headers={"Authorization": auth_header, "Content-Type": "application/json"},
+                headers={
+                    "Authorization": auth_header,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
                 params={"limit": 1},
             )
             r.raise_for_status()
@@ -127,13 +138,19 @@ def oracle_get(endpoint: str, params: dict | None = None) -> dict:
     auth_header = st.session_state.oracle_auth_header
 
     if not st.session_state.oracle_validated or not base_url or not auth_header:
-        raise RuntimeError(json.dumps({"error": "Oracle not connected. Fill creds and ensure status shows Connected ✅."}))
+        raise RuntimeError(
+            json.dumps({"error": "Oracle not connected. Fill creds and ensure status shows Connected ✅."})
+        )
 
     url = build_fusion_url(base_url, endpoint)
-    with httpx.Client(timeout=60.0, verify=False) as client:
+    with httpx.Client(timeout=60.0, verify=st.session_state.tls_verify) as client:
         resp = client.get(
             url,
-            headers={"Authorization": auth_header, "Content-Type": "application/json"},
+            headers={
+                "Authorization": auth_header,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
             params=params or {},
         )
         resp.raise_for_status()
@@ -143,113 +160,120 @@ def oracle_get(endpoint: str, params: dict | None = None) -> dict:
 # =========================
 # Tools
 # =========================
-def tool_find_customers(args: dict) -> str:
-    """Find customer accounts by exact-ish name (best-effort across pods)."""
-    name = (args.get("name") or "").strip()
-    limit = int(args.get("limit", 10))
-    if not name:
-        return json.dumps({"error": "name is required"})
-
-    candidate_endpoints = ["customerAccounts", "customers", "tradingCommunityCustomers"]
-
-    query_patterns = [
-        f"CustomerName={name}",
-        f"PartyName={name}",
-        f"AccountName={name}",
-        f"CustomerAccountName={name}",
-    ]
-
-    errors = []
-    for ep in candidate_endpoints:
-        for q in query_patterns:
-            try:
-                data = oracle_get(ep, {"q": q, "limit": limit})
-                items = data.get("items", [])
-                if items:
-                    results = []
-                    for it in items:
-                        results.append(
-                            {
-                                "customer_account_id": it.get("CustomerAccountId")
-                                or it.get("AccountId")
-                                or it.get("CustAccountId"),
-                                "customer_name": it.get("CustomerName")
-                                or it.get("PartyName")
-                                or it.get("AccountName")
-                                or it.get("CustomerAccountName"),
-                            }
-                        )
-                    return json.dumps({"endpoint_used": ep, "query_used": q, "matches": results}, indent=2)
-            except Exception as e:
-                errors.append({"endpoint": ep, "q": q, "error": str(e)[:200]})
-
-    return json.dumps(
-        {
-            "error": "Could not find customer by name with available endpoints/queries on this pod.",
-            "hint": "Pod may use a different customer endpoint.",
-            "attempts": errors[:6],
-        },
-        indent=2,
-    )
-
-
 def tool_list_customers(args: dict) -> str:
-    """List customers by name prefix (ABC -> ABC%)."""
+    """
+    List customers by name prefix using Financials LOV finder.
+    IMPORTANT: This finder typically requires min 3 characters.
+    """
     starts_with = (args.get("starts_with") or "").strip()
     limit = int(args.get("limit", 10))
+
     if not starts_with:
         return json.dumps({"error": "starts_with is required"})
+    if len(starts_with) < 3:
+        return json.dumps({"error": "starts_with must be at least 3 characters."})
 
-    candidate_endpoints = ["customerAccounts", "customers", "tradingCommunityCustomers"]
+    try:
+        data = oracle_get(
+            "customerAccountSitesLOV",
+            {
+                "finder": f"ReceivablesCustomerAccountFinder;SitePurpose=BILL_TO,CustomerName={starts_with}",
+                "limit": limit,
+            },
+        )
 
-    # Different pods accept different query syntaxes. Try multiple.
-    query_patterns = [
-        f"CustomerName LIKE '{starts_with}%'",
-        f"PartyName LIKE '{starts_with}%'",
-        f"AccountName LIKE '{starts_with}%'",
-        f"CustomerAccountName LIKE '{starts_with}%'",
-        # fallback (some pods only accept "="; this will be weaker)
-        f"CustomerName={starts_with}",
-    ]
+        items = data.get("items", [])
+        results = []
+        seen = set()
 
-    errors = []
-    for ep in candidate_endpoints:
-        for q in query_patterns:
-            try:
-                data = oracle_get(ep, {"q": q, "limit": limit})
-                items = data.get("items", [])
-                if not items:
-                    continue
+        for it in items:
+            caid = it.get("CustomerAccountId")
+            cname = it.get("CustomerName")
+            acct = it.get("AccountNumber")
+            if not (caid or cname):
+                continue
+            key = (caid, cname, acct)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(
+                {
+                    "customer_account_id": caid,
+                    "customer_name": cname,
+                    "account_number": acct,
+                }
+            )
 
-                results = []
-                for it in items:
-                    results.append(
-                        {
-                            "customer_account_id": it.get("CustomerAccountId")
-                            or it.get("AccountId")
-                            or it.get("CustAccountId"),
-                            "customer_name": it.get("CustomerName")
-                            or it.get("PartyName")
-                            or it.get("AccountName")
-                            or it.get("CustomerAccountName"),
-                        }
-                    )
+        return json.dumps(
+            {
+                "endpoint_used": "customerAccountSitesLOV",
+                "finder_used": "ReceivablesCustomerAccountFinder",
+                "count": len(results),
+                "customers": results,
+            },
+            indent=2,
+        )
 
-                # Remove null names/ids
-                results = [r for r in results if r["customer_name"] or r["customer_account_id"]]
-                return json.dumps({"endpoint_used": ep, "query_used": q, "customers": results}, indent=2)
+    except Exception as e:
+        if isinstance(e, RuntimeError):
+            return str(e)
+        return handle_oracle_error(e)
 
-            except Exception as e:
-                errors.append({"endpoint": ep, "q": q, "error": str(e)[:200]})
 
-    return json.dumps(
-        {
-            "error": "Customer prefix search failed on this pod.",
-            "hint": "Adjust customer endpoints or query syntax for your pod.",
-            "attempts": errors[:6],
-        },
-        indent=2,
-    )
+def tool_find_customers(args: dict) -> str:
+    """Find customers by name using the same LOV finder (best-effort)."""
+    name = (args.get("name") or "").strip()
+    limit = int(args.get("limit", 10))
+
+    if not name:
+        return json.dumps({"error": "name is required"})
+    if len(name) < 3:
+        return json.dumps({"error": "name must be at least 3 characters."})
+
+    try:
+        data = oracle_get(
+            "customerAccountSitesLOV",
+            {
+                "finder": f"ReceivablesCustomerAccountFinder;SitePurpose=BILL_TO,CustomerName={name}",
+                "limit": limit,
+            },
+        )
+
+        items = data.get("items", [])
+        matches = []
+        seen = set()
+
+        for it in items:
+            caid = it.get("CustomerAccountId")
+            cname = it.get("CustomerName")
+            acct = it.get("AccountNumber")
+            if not (caid or cname):
+                continue
+            if caid in seen:
+                continue
+            seen.add(caid)
+            matches.append(
+                {
+                    "customer_account_id": caid,
+                    "customer_name": cname,
+                    "account_number": acct,
+                }
+            )
+
+        return json.dumps(
+            {
+                "endpoint_used": "customerAccountSitesLOV",
+                "finder_used": "ReceivablesCustomerAccountFinder",
+                "count": len(matches),
+                "matches": matches,
+            },
+            indent=2,
+        )
+
+    except Exception as e:
+        if isinstance(e, RuntimeError):
+            return str(e)
+        return handle_oracle_error(e)
 
 
 def tool_list_invoices(args: dict) -> str:
@@ -474,7 +498,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "oracle_ar_list_customers",
-            "description": "List customers by name prefix (e.g., starts_with='ABC'). Use when user asks for customer names or lists.",
+            "description": "List customers by name prefix (min 3 chars). Use when user asks for customer names or lists.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -489,7 +513,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "oracle_ar_find_customers",
-            "description": "Find customer accounts by full customer name, returning candidate customer_account_id values.",
+            "description": "Find customers by (partial/full) name (min 3 chars). Returns customer_account_id.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -637,10 +661,16 @@ with st.sidebar:
         "Password", type="password", value=st.session_state.oracle_password, on_change=mark_oracle_dirty
     )
 
+    st.session_state.tls_verify = st.checkbox(
+        "TLS verify (recommended)",
+        value=st.session_state.tls_verify,
+        help="Keep ON unless you are debugging a broken TLS chain in a sandbox network.",
+        on_change=mark_oracle_dirty,
+    )
+
     # auto-validate silently
     oracle_validate_if_needed()
 
-    # show only meaningful status; no "not connected" spam
     if st.session_state.oracle_status == "Connected ✅":
         st.success("Connected ✅")
     elif st.session_state.oracle_status == "Connection failed ❌":
@@ -671,7 +701,7 @@ if user_text:
                     "You MUST use tools for customer discovery, customer lists, invoices, receipts, aging, and summaries. "
                     "If the user asks for customer names or customers starting with a prefix, call oracle_ar_list_customers. "
                     "If the user gives a full customer name and needs invoices, call oracle_ar_find_customers then oracle_ar_list_invoices. "
-                    "Do not claim you lack access if a relevant tool exists."
+                    "If a tool returns an error, surface the error details briefly and suggest the next best tool call."
                 ),
             }
         ] + st.session_state.chat
